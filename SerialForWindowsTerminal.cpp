@@ -6,7 +6,7 @@
 #include <vector>
 #include <string>
 #include <iostream>
-#include <boost/asio.hpp> 
+#include <boost/asio.hpp>
 #include <boost/asio/windows/stream_handle.hpp>
 
 #define MAX_LOADSTRING 100
@@ -237,7 +237,7 @@ static void DoStreamToStream(TStream1& stream1, TStream2& stream2, std::vector<u
     );
 }
 
-static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::asio::serial_port& serialPort)
+static boost::system::error_code DoWork(boost::asio::io_context& ioctx, boost::asio::serial_port& serialPort)
 {
     boost::system::error_code ec;
     boost::asio::windows::stream_handle stdinput(ioctx);
@@ -259,14 +259,14 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
 
     DoStreamToStream(serialPort, stdoutput, serialPortRecvBuffer);
     DoStreamToStream(stdinput, serialPort, serialPortSendBuffer);
-    ioctx.run(ec);
+    ioctx.run();
     return ec;
 }
 
 int wmain(int argc, const WCHAR* args[])
 {
     boost::system::error_code ec;
-    boost::asio::io_service ioctx;
+    boost::asio::io_context ioctx;
     boost::asio::serial_port serialPort(ioctx);
     hInstance = GetModuleHandle(nullptr);
 
