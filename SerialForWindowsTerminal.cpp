@@ -95,7 +95,31 @@ typedef struct
     DWORD StopBit;
     DWORD Parity;
     DWORD FlowControl;
+    DWORD Encoding;
 }SERIAL_CONFIG;
+
+static std::string ConvertEncoding(const std::string& text, DWORD from, DWORD to)
+{
+    if (text.empty() || from == to)
+        return text;
+
+    std::wstring wstr;
+    int wlen = MultiByteToWideChar(from, 0, text.c_str(), (int)text.size(), NULL, 0);
+    if (wlen > 0)
+    {
+        wstr.resize(wlen);
+        MultiByteToWideChar(from, 0, text.c_str(), (int)text.size(), &wstr[0], wlen);
+    }
+
+    std::string result;
+    int mblen = WideCharToMultiByte(to, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+    if (mblen > 0)
+    {
+        result.resize(mblen);
+        WideCharToMultiByte(to, 0, wstr.c_str(), (int)wstr.size(), &result[0], mblen, NULL, NULL);
+    }
+    return result;
+}
 
 static SERIAL_CONFIG ReadSerialConfig()
 {
@@ -107,6 +131,7 @@ static SERIAL_CONFIG ReadSerialConfig()
     cfg.StopBit = ONESTOPBIT;
     cfg.Parity = NOPARITY;
     cfg.FlowControl = 0;
+    cfg.Encoding = CP_UTF8;
     if (ERROR_SUCCESS == ::RegOpenKeyEx(HKEY_CURRENT_USER, L"SOFTWARE\\SerialForWindowsTerminal", 0, KEY_READ, &hKey))
     {
         DWORD dwSize = sizeof(DWORD);
@@ -118,6 +143,7 @@ static SERIAL_CONFIG ReadSerialConfig()
         ::RegQueryValueEx(hKey, L"StopBit", 0, &dwType, (LPBYTE)&cfg.StopBit, &dwSize);
         ::RegQueryValueEx(hKey, L"Parity", 0, &dwType, (LPBYTE)&cfg.Parity, &dwSize);
         ::RegQueryValueEx(hKey, L"FlowControl", 0, &dwType, (LPBYTE)&cfg.FlowControl, &dwSize);
+        ::RegQueryValueExW(hKey, L"Encoding", 0, &dwType, (LPBYTE)&cfg.Encoding, &dwSize);
         ::RegCloseKey(hKey);
     }
     return cfg;
@@ -137,6 +163,7 @@ static void WriteSerialConfig(const SERIAL_CONFIG& cfg)
         ::RegSetValueEx(hKey, L"StopBit", 0, dwType, (CONST LPBYTE) & cfg.StopBit, dwSize);
         ::RegSetValueEx(hKey, L"Parity", 0, dwType, (CONST LPBYTE) & cfg.Parity, dwSize);
         ::RegSetValueEx(hKey, L"FlowControl", 0, dwType, (CONST LPBYTE) & cfg.FlowControl, dwSize);
+        ::RegSetValueEx(hKey, L"Encoding", 0, dwType, (CONST LPBYTE) & cfg.Encoding, dwSize);
         ::RegCloseKey(hKey);
     }
 }
@@ -243,6 +270,62 @@ static boost::system::error_code DoWork(boost::asio::io_context& ioctx, boost::a
     boost::asio::windows::stream_handle stdinput(ioctx);
     boost::asio::windows::stream_handle stdoutput(ioctx);
     const auto kBufferSize = 1024;
+
+    // 读取配置（包含编码设置）
+    auto cfg = ReadSerialConfig();
+
+    // 获取控制台当前输入和输出编码
+    UINT consoleInputCP = GetConsoleCP();
+    UINT consoleOutputCP = GetConsoleOutputCP();
+    const DWORD targetEncoding = cfg.Encoding;
+
+    // 编码转换函数
+    auto convertEncoding = [](const std::vector<uint8_t>& input, DWORD from, DWORD to) -> std::vector<uint8_t> {
+        if (input.empty() || from == to) {
+            return input;
+        }
+
+        // 将输入数据转换为宽字符
+        std::wstring wstr;
+        int wlen = MultiByteToWideChar(from, 0,
+            reinterpret_cast<const char*>(input.data()),
+            static_cast<int>(input.size()),
+            NULL, 0);
+        if (wlen <= 0) return input;
+
+        wstr.resize(wlen);
+        if (MultiByteToWideChar(from, 0,
+            reinterpret_cast<const char*>(input.data()),
+            static_cast<int>(input.size()),
+            &wstr[0], wlen) == 0) {
+            return input;
+        }
+
+        // 将宽字符转换为目标编码
+        std::vector<uint8_t> result;
+        int mblen = WideCharToMultiByte(to, 0, wstr.data(), static_cast<int>(wstr.size()),
+            NULL, 0, NULL, NULL);
+        if (mblen <= 0) return input;
+
+        result.resize(mblen);
+        if (WideCharToMultiByte(to, 0, wstr.data(), static_cast<int>(wstr.size()),
+            reinterpret_cast<char*>(result.data()), mblen, NULL, NULL) == 0) {
+            return input;
+        }
+        return result;
+        };
+
+    // 发送转换: 控制台输入编码 -> 目标编码
+    auto convertForSend = [&](const std::vector<uint8_t>& input) {
+        return convertEncoding(input, consoleInputCP, targetEncoding);
+        };
+
+    // 接收转换: 目标编码 -> 控制台输出编码
+    auto convertForRecv = [&](const std::vector<uint8_t>& input) {
+        return convertEncoding(input, targetEncoding, consoleOutputCP);
+        };
+
+    // 缓冲区
     std::vector<uint8_t> serialPortRecvBuffer;
     std::vector<uint8_t> serialPortSendBuffer;
     serialPortRecvBuffer.resize(kBufferSize);
@@ -257,8 +340,92 @@ static boost::system::error_code DoWork(boost::asio::io_context& ioctx, boost::a
     if (stdoutput.assign(conout, ec))
         return ec;
 
-    DoStreamToStream(serialPort, stdoutput, serialPortRecvBuffer);
-    DoStreamToStream(stdinput, serialPort, serialPortSendBuffer);
+    // 使用 std::function 定义处理器类型
+    using StreamHandler = std::function<void()>;
+
+    // 创建处理器对象
+    StreamHandler recvHandler;
+    StreamHandler sendHandler;
+
+    // 接收方向：串口 -> 控制台
+    recvHandler = [&]() {
+        serialPort.async_read_some(
+            boost::asio::buffer(serialPortRecvBuffer),
+            [&](const boost::system::error_code& ec, size_t bytes_transferred) {
+                if (ec) {
+                    std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
+                    return;
+                }
+
+                // 复制接收到的数据
+                std::vector<uint8_t> received(
+                    serialPortRecvBuffer.begin(),
+                    serialPortRecvBuffer.begin() + bytes_transferred
+                );
+
+                // 应用编码转换
+                auto converted = convertForRecv(received);
+
+                // 写入转换后的数据
+                boost::asio::async_write(
+                    stdoutput,
+                    boost::asio::buffer(converted),
+                    [&](const boost::system::error_code& ec, size_t) {
+                        if (ec) {
+                            std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
+                            return;
+                        }
+
+                        // 继续处理下一批数据
+                        recvHandler();
+                    }
+                );
+            }
+        );
+        };
+
+    // 发送方向：控制台 -> 串口
+    sendHandler = [&]() {
+        stdinput.async_read_some(
+            boost::asio::buffer(serialPortSendBuffer),
+            [&](const boost::system::error_code& ec, size_t bytes_transferred) {
+                if (ec) {
+                    std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
+                    return;
+                }
+
+                // 复制接收到的数据
+                std::vector<uint8_t> received(
+                    serialPortSendBuffer.begin(),
+                    serialPortSendBuffer.begin() + bytes_transferred
+                );
+
+                // 应用编码转换
+                auto converted = convertForSend(received);
+
+                // 写入转换后的数据
+                boost::asio::async_write(
+                    serialPort,
+                    boost::asio::buffer(converted),
+                    [&](const boost::system::error_code& ec, size_t) {
+                        if (ec) {
+                            std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
+                            return;
+                        }
+
+                        // 继续处理下一批数据
+                        sendHandler();
+                    }
+                );
+            }
+        );
+        };
+
+    // 启动两个方向的处理器
+    recvHandler();
+    sendHandler();
+
+    // 运行IO上下文
     ioctx.run();
     return ec;
 }
@@ -420,6 +587,21 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
         ComboBox_AddString(hWndFlowControl, L"硬件");
         ComboBox_SetCurSel(hWndFlowControl, (int)(cfg.FlowControl));
 
+        auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING); 
+        ComboBox_AddString(hWndEncoding, L"UTF-8 (65001)");
+        ComboBox_AddString(hWndEncoding, L"GBK (936)");
+        ComboBox_AddString(hWndEncoding, L"BIG5 (950)");
+        ComboBox_AddString(hWndEncoding, L"Shift-JIS (932)");
+
+        int encodingIndex = 0;
+        switch (cfg.Encoding) {
+        case 936: encodingIndex = 1; break;
+        case 950: encodingIndex = 2; break;
+        case 932: encodingIndex = 3; break;
+        default: encodingIndex = 0; break;
+        }
+        ComboBox_SetCurSel(hWndEncoding, encodingIndex);
+
         return (INT_PTR)TRUE;
     }
     case WM_DEVICECHANGE:
@@ -455,6 +637,17 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
                 cfg.StopBit = ComboBox_GetCurSel(hWndStopBit);
                 cfg.Parity = ComboBox_GetCurSel(hWndParity);
                 cfg.FlowControl = ComboBox_GetCurSel(hWndFlowControl);
+
+                auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING);
+                int encodingIndex = ComboBox_GetCurSel(hWndEncoding);
+                switch (encodingIndex) {
+                case 0: cfg.Encoding = CP_UTF8; break;    // 65001
+                case 1: cfg.Encoding = 936; break;        // GB2312
+                case 2: cfg.Encoding = 950; break;        // BIG5
+                case 3: cfg.Encoding = 932; break;        // Shift-JIS
+                default: cfg.Encoding = CP_UTF8; break;
+                }
+
                 WriteSerialConfig(cfg);
             }
             EndDialog(hDlg, LOWORD(wParam));
