@@ -1,6 +1,5 @@
 ﻿// SerialForWindowsTerminal.cpp : 定义应用程序的入口点。
 //
-
 #include "framework.h"
 #include "SerialForWindowsTerminal.h"
 #include <vector>
@@ -8,6 +7,7 @@
 #include <iostream>
 #include <boost/asio.hpp>
 #include <boost/asio/windows/stream_handle.hpp>
+#include <shellscalingapi.h> // 引入 shellscalingapi.h 以支持高 DPI
 
 #define MAX_LOADSTRING 100
 
@@ -85,6 +85,58 @@ static void CenterParentWindow(HWND hWnd)
         0,
         0,
         SWP_NOZORDER | SWP_NOSIZE);
+}
+
+// 获取窗口的 DPI 比例
+static float GetDpiScale(HWND hWnd)
+{
+    UINT dpi = 96; // 默认 DPI
+    if (GetDpiForWindow)
+    {
+        dpi = GetDpiForWindow(hWnd);
+    }
+    return static_cast<float>(dpi) / 96.0f;
+}
+
+// 缩放对话框中的所有子控件，以保持布局一致性
+static void ScaleDialogControls(HWND hDlg)
+{
+    float dpiScale = GetDpiScale(hDlg);
+    if (dpiScale <= 1.0f) {
+        return; // 如果 DPI 比例小于等于 1.0，则无需缩放
+    }
+
+    // 遍历并缩放所有子控件
+    HWND hChild = GetTopWindow(hDlg);
+    while (hChild)
+    {
+        RECT rcChild;
+        // 获取控件在父窗口中的坐标
+        GetWindowRect(hChild, &rcChild);
+        MapWindowPoints(nullptr, hDlg, (LPPOINT)&rcChild, 2);
+
+        int newLeft = static_cast<int>(rcChild.left * dpiScale);
+        int newTop = static_cast<int>(rcChild.top * dpiScale);
+        int newChildWidth = static_cast<int>((rcChild.right - rcChild.left) * dpiScale);
+        int newChildHeight = static_cast<int>((rcChild.bottom - rcChild.top) * dpiScale);
+
+        SetWindowPos(hChild, nullptr, newLeft, newTop, newChildWidth, newChildHeight, SWP_NOZORDER);
+
+        // 缩放字体
+        HFONT hFont = (HFONT)SendMessage(hChild, WM_GETFONT, 0, 0);
+        if (hFont)
+        {
+            LOGFONT lf;
+            GetObject(hFont, sizeof(LOGFONT), &lf);
+            // 调整字体高度以匹配新的 DPI
+            lf.lfHeight = MulDiv(lf.lfHeight, GetDpiForWindow(hDlg), 96);
+            HFONT hNewFont = CreateFontIndirect(&lf);
+            SendMessage(hChild, WM_SETFONT, (WPARAM)hNewFont, TRUE);
+            DeleteObject(hFont); // 释放旧字体，避免内存泄漏
+        }
+
+        hChild = GetNextWindow(hChild, GW_HWNDNEXT);
+    }
 }
 
 typedef struct
@@ -168,7 +220,7 @@ static void WriteSerialConfig(const SERIAL_CONFIG& cfg)
     }
 }
 
-static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& serialPort,const SERIAL_CONFIG& cfg, boost::system::error_code& ec)
+static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& serialPort, const SERIAL_CONFIG& cfg, boost::system::error_code& ec)
 {
     serialPort.set_option(boost::asio::serial_port::baud_rate(cfg.BaudRate), ec);
     if (ec)
@@ -227,7 +279,7 @@ static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& 
         serialPort.set_option(boost::asio::serial_port::flow_control(boost::asio::serial_port::flow_control::none), ec);
         break;
     }
-    
+
     return ec;
 }
 
@@ -432,6 +484,13 @@ static boost::system::error_code DoWork(boost::asio::io_context& ioctx, boost::a
 
 int wmain(int argc, const WCHAR* args[])
 {
+    // 设置进程为 Per-Monitor V2 DPI 感知，
+    if (S_OK != SetProcessDpiAwarenessContext(static_cast<DPI_AWARENESS_CONTEXT>(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))) 
+    {
+        // 如果失败，可以回退到旧的 API
+        SetProcessDPIAware();
+    }
+
     boost::system::error_code ec;
     boost::asio::io_context ioctx;
     boost::asio::serial_port serialPort(ioctx);
@@ -464,7 +523,7 @@ int wmain(int argc, const WCHAR* args[])
             auto portName = std::string("COM") + std::to_string(cfg.Serial);
             if (serialPort.open(portName, ec))
             {
-                std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" <<std::endl;
+                std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" << std::endl;
                 std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
                 continue;
             }
@@ -497,9 +556,24 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
     switch (message)
     {
     case WM_INITDIALOG:
+        // 让 Windows 根据 DPI 自动初始化对话框大小
         CenterParentWindow(hDlg);
         return (INT_PTR)TRUE;
-
+    case WM_DPICHANGED:
+    {
+        // 当 DPI 改变时，重新调整窗口大小并缩放内容
+        RECT* prcNewDialog = (RECT*)lParam;
+        SetWindowPos(hDlg,
+            NULL,
+            prcNewDialog->left,
+            prcNewDialog->top,
+            prcNewDialog->right - prcNewDialog->left,
+            prcNewDialog->bottom - prcNewDialog->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        // 缩放子控件
+        ScaleDialogControls(hDlg);
+        return (INT_PTR)TRUE;
+    }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
@@ -518,7 +592,9 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
     {
     case WM_INITDIALOG:
     {
+        //让 Windows 根据 DPI 自动初始化对话框大小
         CenterParentWindow(hDlg);
+
         auto cfg = ReadSerialConfig();
         auto hWndPort = GetDlgItem(hDlg, IDC_COMBO_PORT);
         UpdatePortControl(hDlg);
@@ -541,7 +617,7 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
         }
 
         auto hWndBaudRate = GetDlgItem(hDlg, IDC_COMBO_SPEED);
-        ComboBox_AddString(hWndBaudRate, L"50"); 
+        ComboBox_AddString(hWndBaudRate, L"50");
         ComboBox_AddString(hWndBaudRate, L"75");
         ComboBox_AddString(hWndBaudRate, L"100");
         ComboBox_AddString(hWndBaudRate, L"105");
@@ -587,7 +663,7 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
         ComboBox_AddString(hWndFlowControl, L"硬件");
         ComboBox_SetCurSel(hWndFlowControl, (int)(cfg.FlowControl));
 
-        auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING); 
+        auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING);
         ComboBox_AddString(hWndEncoding, L"UTF-8 (65001)");
         ComboBox_AddString(hWndEncoding, L"GBK (936)");
         ComboBox_AddString(hWndEncoding, L"BIG5 (950)");
@@ -607,12 +683,27 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
     case WM_DEVICECHANGE:
         UpdatePortControl(hDlg);
         return (INT_PTR)TRUE;
+    case WM_DPICHANGED:
+    {
+        // 当 DPI 改变时，重新调整窗口大小并缩放内容
+        RECT* prcNewDialog = (RECT*)lParam;
+        SetWindowPos(hDlg,
+            NULL,
+            prcNewDialog->left,
+            prcNewDialog->top,
+            prcNewDialog->right - prcNewDialog->left,
+            prcNewDialog->bottom - prcNewDialog->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        // 缩放子控件
+        ScaleDialogControls(hDlg);
+        return (INT_PTR)TRUE;
+    }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             if (LOWORD(wParam) == IDOK)
             {
-                SERIAL_CONFIG cfg = {0};
+                SERIAL_CONFIG cfg = { 0 };
                 auto hWndPort = GetDlgItem(hDlg, IDC_COMBO_PORT);
                 auto hWndBaudRate = GetDlgItem(hDlg, IDC_COMBO_SPEED);
                 auto hWndWordLength = GetDlgItem(hDlg, IDC_COMBO_WORD);
@@ -620,7 +711,7 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
                 auto hWndParity = GetDlgItem(hDlg, IDC_COMBO_PARITY);
                 auto hWndFlowControl = GetDlgItem(hDlg, IDC_COMBO_FLOW_CONTROL);
 
-                WCHAR txtBuffer[32] = {0};
+                WCHAR txtBuffer[32] = { 0 };
                 auto curSel = ComboBox_GetCurSel(hWndPort);
                 if (curSel >= 0)
                 {
