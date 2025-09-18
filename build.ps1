@@ -1,179 +1,148 @@
-param(
-    [Parameter(Position=0)]
-    [string[]]$Args,
-    
+﻿param(
     [Alias("h", "?")]
     [switch]$help,
     [Alias("win32")]
     [switch]$x86,
     [switch]$x64,
-    [Alias("d")]
+    [Alias("d", "debug")]
     [switch]$dbg,
-    [Alias("r")]
+    [Alias("r", "release")]
     [switch]$rel,
+    [Alias("a")]
     [switch]$all
 )
 
-# 设置输出编码为 UTF-8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# 字符编码设置：确保中文在控制台正确显示
+try { chcp.com 65001 > $null } catch {}
+$utf8 = [System.Text.Encoding]::UTF8
+$OutputEncoding = $utf8           # 外部进程与管道编码
+[Console]::OutputEncoding = $utf8 # 控制台输出编码
+[Console]::InputEncoding  = $utf8 # 控制台输入编码
 
-# 查找 Visual Studio 安装路径
+# Normalize unmatched args to support forms like: x64 debug all
+$normalized = @()
+foreach ($arg in $args) {
+    if ($null -ne $arg) { $normalized += ($arg.ToString()).ToLowerInvariant() }
+}
+foreach ($a in $normalized) {
+    switch -regex ($a) {
+        '^(?:-)?(?:help|h|\?)$'     { $help = $true }
+        '^(?:-)?(?:all|a)$'          { $all = $true }
+        '^(?:-)?(?:x64)$'            { $x64 = $true }
+        '^(?:-)?(?:x86|win32)$'      { $x86 = $true }
+        '^(?:-)?(?:debug|dbg|d)$'    { $dbg = $true }
+        '^(?:-)?(?:release|rel|r)$'  { $rel = $true }
+    }
+}
+
+# Defaults
+$arch = "all"
+$cfg  = "all"
+
+# 帮助优先显示（无需安装 VS 也可查看）
+if ($help) {
+    Write-Host "用法: build.ps1 [选项]"
+    Write-Host ""
+    Write-Host "选项:"
+    Write-Host "  -help, -h, -?        显示本帮助信息"
+    Write-Host "  -x86, -win32         构建 x86 架构"
+    Write-Host "  -x64                 构建 x64 架构"
+    Write-Host "  -debug, -dbg, -d     构建 Debug 版本"
+    Write-Host "  -release, -rel, -r   构建 Release 版本"
+    Write-Host "  -all, -a             构建全部（架构 + 配置）"
+    Write-Host "  默认: 构建全部"
+    exit 0
+}
+
+# Parse switches into arch/cfg
+if ($x86) { $arch = "x86" } elseif ($x64) { $arch = "x64" }
+if ($dbg) { $cfg  = "debug" } elseif ($rel) { $cfg = "release" }
+if ($all) { $arch = "all"; $cfg = "all" }
+
+# Locate Visual Studio
 $VS_PATH = $null
 $VS_VERSION = $null
 
-# 首先检查 VS2022
 $VS2022_PATHS = @(
     "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional",
     "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise",
     "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community"
 )
-
 foreach ($path in $VS2022_PATHS) {
-    if (Test-Path "$path\Common7\IDE\devenv.com") {
-        $VS_PATH = $path
-        $VS_VERSION = "2022"
-        break
-    }
+    if (Test-Path "$path\Common7\IDE\devenv.com") { $VS_PATH = $path; $VS_VERSION = "2022"; break }
 }
 
-# 如果没找到VS2022，检查VS2019
 if (-not $VS_PATH) {
     $VS2019_PATHS = @(
         "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2019\Professional",
         "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2019\Enterprise",
         "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2019\Community"
     )
-
     foreach ($path in $VS2019_PATHS) {
-        if (Test-Path "$path\Common7\IDE\devenv.com") {
-            $VS_PATH = $path
-            $VS_VERSION = "2019"
-            break
-        }
+        if (Test-Path "$path\Common7\IDE\devenv.com") { $VS_PATH = $path; $VS_VERSION = "2019"; break }
     }
 }
 
 if (-not $VS_PATH) {
-    Write-Error "错误: 未找到 Visual Studio 2019 或 2022"
+    Write-Error "错误：未找到 Visual Studio 2019 或 2022"
     exit 1
 }
 
-Write-Host "找到 Visual Studio $VS_VERSION 在: $VS_PATH"
+Write-Host "找到 Visual Studio $($VS_VERSION)：$VS_PATH"
 
-# 导入环境变量
+# Import VS dev environment
 $VsDevCmd = Join-Path $VS_PATH "Common7\Tools\VsDevCmd.bat"
 if (Test-Path $VsDevCmd) {
-    # 使用 cmd.exe 运行 VsDevCmd.bat 并导入其环境变量
     $Command = "`"$VsDevCmd`" & set"
     cmd /c $Command | ForEach-Object {
-        if ($_ -match '^([^=]+)=(.*)$') {
-            $varName = $matches[1]
-            $varValue = $matches[2]
-            Set-Item "env:$varName" $varValue
-        }
+        if ($_ -match '^([^=]+)=(.*)$') { Set-Item "env:$($matches[1])" $matches[2] }
     }
 }
 
-# 参数解析
-$arch = "all"
-$cfg = "all"
-
-# 检查是否需要显示帮助
-if ($help -or $h -or $Args -contains "help" -or $Args -contains "/?" -or $Args -contains "-help") {
-    Write-Host "用法: build.ps1 [选项]"
-    Write-Host ""
-    Write-Host "选项:"
-    Write-Host "  -help, -h, -?      显示本帮助信息"
-    Write-Host "  -x86, -win32       仅编译 x86 架构"
-    Write-Host "  -x64               仅编译 x64 架构"
-    Write-Host "  -dbg, -d          仅编译 Debug 版本"
-    Write-Host "  -rel, -r          仅编译 Release 版本"
-    Write-Host "  -all              编译全部架构和类型"
-    Write-Host "  默认全部编译"
-    exit 0
-}
-
-# 处理架构参数
-if ($x86) { $arch = "x86" }
-elseif ($x64) { $arch = "x64" }
-
-# 处理配置参数
-if ($dbg) { $cfg = "debug" }
-elseif ($rel) { $cfg = "release" }
-
-# 处理全部编译参数
-if ($all) { $arch = "all"; $cfg = "all" }
-
-# 创建输出目录
-if (-not (Test-Path "bin")) {
-    New-Item -ItemType Directory -Path "bin" | Out-Null
-}
+# 确保 bin 目录存在
+if (-not (Test-Path "bin")) { New-Item -ItemType Directory -Path "bin" | Out-Null }
 
 Write-Host "开始构建..."
 
 function Build-Project {
-    param (
+    param(
         [string]$Platform,
         [string]$Configuration
     )
-    Write-Host "正在构建 $Platform $Configuration 版本..."
-    $result = msbuild SerialForWindowsTerminal.vcxproj /p:Configuration=$Configuration /p:Platform=$Platform /t:Rebuild
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "$Platform $Configuration 构建失败"
-        return $false
-    }
+    Write-Host "正在构建 $Platform $Configuration..."
+    msbuild SerialForWindowsTerminal.vcxproj /p:Configuration=$Configuration /p:Platform=$Platform /t:Rebuild
+    if ($LASTEXITCODE -ne 0) { Write-Error "$Platform $Configuration 构建失败"; return $false }
     return $true
 }
 
-# 构建逻辑
-$archList = @()
-if ($arch -eq "all") {
-    $archList = @("Win32", "x64")
-} elseif ($arch -eq "x86") {
-    $archList = @("Win32")
-} elseif ($arch -eq "x64") {
-    $archList = @("x64")
-}
-
-$cfgList = @()
-if ($cfg -eq "all") {
-    $cfgList = @("Debug", "Release")
-} elseif ($cfg -eq "debug") {
-    $cfgList = @("Debug")
-} elseif ($cfg -eq "release") {
-    $cfgList = @("Release")
-}
+# Expand lists
+$archList = if ($arch -eq "all") { @("Win32","x64") } elseif ($arch -eq "x86") { @("Win32") } else { @("x64") }
+$cfgList  = if ($cfg  -eq "all") { @("Debug","Release") } elseif ($cfg -eq "debug") { @("Debug") } else { @("Release") }
 
 $buildFailed = $false
 foreach ($p in $archList) {
     foreach ($c in $cfgList) {
-        if (-not (Build-Project $p $c)) {
-            $buildFailed = $true
-        }
+        if (-not (Build-Project $p $c)) { $buildFailed = $true }
     }
 }
 
-if ($buildFailed) {
-    Write-Error "有部分版本构建失败"
-    exit 1
-}
+if ($buildFailed) { Write-Error "一个或多个目标构建失败"; exit 1 }
 
-Write-Host "所有指定版本构建完成！"
-Write-Host "构建文件在 Debug/Release 和 x64\Debug/Release 目录中"
+Write-Host "已完成全部指定目标的构建"
+Write-Host "构建产物位于 Debug/Release 与 x64/Debug/Release 目录"
 
-# 复制编译结果到 bin 目录
+# Copy artifacts into bin
 if ($arch -eq "all") {
     Copy-Item "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" -ErrorAction SilentlyContinue
     Copy-Item "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" -ErrorAction SilentlyContinue
     Copy-Item "x64\Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_debug.exe" -ErrorAction SilentlyContinue
     Copy-Item "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" -ErrorAction SilentlyContinue
 } elseif ($arch -eq "x86") {
-    Copy-Item "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" -ErrorAction SilentlyContinue
-    Copy-Item "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" -ErrorAction SilentlyContinue
+    if ($cfg -eq "all" -or $cfg -eq "debug") { Copy-Item "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" -ErrorAction SilentlyContinue }
+    if ($cfg -eq "all" -or $cfg -eq "release") { Copy-Item "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" -ErrorAction SilentlyContinue }
 } elseif ($arch -eq "x64") {
-    Copy-Item "x64\Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_debug.exe" -ErrorAction SilentlyContinue
-    Copy-Item "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" -ErrorAction SilentlyContinue
+    if ($cfg -eq "all" -or $cfg -eq "debug") { Copy-Item "x64\Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_debug.exe" -ErrorAction SilentlyContinue }
+    if ($cfg -eq "all" -or $cfg -eq "release") { Copy-Item "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" -ErrorAction SilentlyContinue }
 }
 
-Write-Host "构建文件已复制到 bin 目录"
+Write-Host "已将构建产物复制到 bin 目录"
