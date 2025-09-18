@@ -84,11 +84,11 @@ if (-not $VS_PATH) {
 }
 
 if (-not $VS_PATH) {
-    Write-Error "错误：未找到 Visual Studio 2019 或 2022"
+    Write-Error "错误: 未找到 Visual Studio 2019 或 2022"
     exit 1
 }
 
-Write-Host "找到 Visual Studio $($VS_VERSION)：$VS_PATH"
+Write-Host "已找到 Visual Studio $($VS_VERSION) ，路径: $VS_PATH"
 
 # Import VS dev environment
 $VsDevCmd = Join-Path $VS_PATH "Common7\Tools\VsDevCmd.bat"
@@ -102,16 +102,14 @@ if (Test-Path $VsDevCmd) {
 # 确保 bin 目录存在
 if (-not (Test-Path "bin")) { New-Item -ItemType Directory -Path "bin" | Out-Null }
 
-Write-Host "开始构建..."
-
-function Build-Project {
+function Invoke-ProjectBuild {
     param(
         [string]$Platform,
         [string]$Configuration
     )
     Write-Host "正在构建 $Platform $Configuration..."
     msbuild SerialForWindowsTerminal.vcxproj /p:Configuration=$Configuration /p:Platform=$Platform /t:Rebuild
-    if ($LASTEXITCODE -ne 0) { Write-Error "$Platform $Configuration 构建失败"; return $false }
+    if ($LASTEXITCODE -ne 0) { Write-Host "构建失败: $Platform $Configuration"; return $false }
     return $true
 }
 
@@ -122,16 +120,16 @@ $cfgList  = if ($cfg  -eq "all") { @("Debug","Release") } elseif ($cfg -eq "debu
 $buildFailed = $false
 foreach ($p in $archList) {
     foreach ($c in $cfgList) {
-        if (-not (Build-Project $p $c)) { $buildFailed = $true }
+        if (-not (Invoke-ProjectBuild $p $c)) { $buildFailed = $true }
     }
 }
 
-if ($buildFailed) { Write-Error "一个或多个目标构建失败"; exit 1 }
+if ($buildFailed) { Write-Error "部分目标构建失败"; exit 1 }
 
-Write-Host "已完成全部指定目标的构建"
+Write-Host "所有指定目标构建成功"
 Write-Host "构建产物位于 Debug/Release 与 x64/Debug/Release 目录"
 
-# Copy artifacts into bin
+# 复制产物到 bin 目录
 if ($arch -eq "all") {
     Copy-Item "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" -ErrorAction SilentlyContinue
     Copy-Item "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" -ErrorAction SilentlyContinue
@@ -145,4 +143,4 @@ if ($arch -eq "all") {
     if ($cfg -eq "all" -or $cfg -eq "release") { Copy-Item "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" -ErrorAction SilentlyContinue }
 }
 
-Write-Host "已将构建产物复制到 bin 目录"
+Write-Host "构建产物已复制到 bin 目录"
