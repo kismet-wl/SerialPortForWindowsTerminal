@@ -1,13 +1,16 @@
 ﻿// SerialForWindowsTerminal.cpp : 定义应用程序的入口点。
 //
+
 #include "framework.h"
 #include "SerialForWindowsTerminal.h"
 #include <vector>
 #include <string>
 #include <iostream>
-#include <boost/asio.hpp>
+#include <functional>
+#include <memory>
+#include <boost/asio.hpp> 
+#include <shellscalingapi.h>
 #include <boost/asio/windows/stream_handle.hpp>
-#include <shellscalingapi.h> // 引入 shellscalingapi.h 以支持高 DPI
 
 #define MAX_LOADSTRING 100
 
@@ -54,6 +57,144 @@ static PortsArray GetAllPorts(void)
     return ports;
 }
 
+// ---- Encoding helpers (chunk-safe) ----
+static size_t ValidPrefixLen(const std::vector<uint8_t>& buf, DWORD codePage)
+{
+    const size_t n = buf.size();
+    if (n == 0) return 0;
+    if (codePage == CP_UTF8)
+    {
+        size_t start = n;
+        while (start > 0 && (buf[start - 1] & 0xC0) == 0x80) --start; // continuation bytes
+        if (start == n)
+        {
+            const uint8_t last = buf[n - 1];
+            if ((last & 0x80) == 0x00) return n;      // ASCII
+            if ((last & 0xE0) == 0xC0) return n - 1;  // 2-byte lead at end
+            if ((last & 0xF0) == 0xE0) return n - 1;  // 3-byte lead at end
+            if ((last & 0xF8) == 0xF0) return n - 1;  // 4-byte lead at end
+            return n;
+        }
+        if (start == 0) return 0; // all continuation bytes, cannot decide
+        const uint8_t lead = buf[start - 1];
+        size_t need = 1;
+        if ((lead & 0xE0) == 0xC0) need = 2;
+        else if ((lead & 0xF0) == 0xE0) need = 3;
+        else if ((lead & 0xF8) == 0xF0) need = 4;
+        else if ((lead & 0x80) == 0x00) need = 1;
+        else return start - 1; // invalid lead, drop it
+        size_t have = n - (start - 1);
+        if (have < need) return start - 1; // incomplete
+        return n;
+    }
+    if (codePage == 936 || codePage == 950 || codePage == 932)
+    {
+        if (IsDBCSLeadByteEx(codePage, buf[n - 1])) return n - 1; // dangling lead byte
+        return n;
+    }
+    return n;
+}
+
+static std::vector<uint8_t> ConvertEncodingBytes(const uint8_t* data, size_t len, DWORD from, DWORD to)
+{
+    std::vector<uint8_t> out;
+    if (len == 0) return out;
+    if (from == to) { out.assign(data, data + len); return out; }
+
+    // bytes -> wide
+    int wlen = MultiByteToWideChar(from, MB_ERR_INVALID_CHARS,
+                                   reinterpret_cast<LPCCH>(data), (int)len,
+                                   nullptr, 0);
+    if (wlen <= 0)
+    {
+        wlen = MultiByteToWideChar(from, 0, reinterpret_cast<LPCCH>(data), (int)len, nullptr, 0);
+        if (wlen <= 0) { out.assign(data, data + len); return out; }
+    }
+    std::wstring wstr; wstr.resize(wlen);
+    if (!MultiByteToWideChar(from, 0, reinterpret_cast<LPCCH>(data), (int)len, &wstr[0], wlen))
+    { out.assign(data, data + len); return out; }
+
+    // wide -> target
+    int mblen = WideCharToMultiByte(to, WC_ERR_INVALID_CHARS, wstr.data(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
+    if (mblen <= 0)
+    {
+        mblen = WideCharToMultiByte(to, 0, wstr.data(), (int)wstr.size(), nullptr, 0, nullptr, nullptr);
+        if (mblen <= 0) { out.assign(data, data + len); return out; }
+    }
+    out.resize(mblen);
+    if (!WideCharToMultiByte(to, 0, wstr.data(), (int)wstr.size(), reinterpret_cast<LPSTR>(out.data()), mblen, nullptr, nullptr))
+    { out.assign(data, data + len); }
+    return out;
+}
+
+// ----- High DPI helpers -----
+static UINT GetWindowDpi(HWND hWnd)
+{
+    if (GetDpiForWindow) {
+        return GetDpiForWindow(hWnd);
+    }
+    HDC hdc = GetDC(hWnd);
+    UINT dpi = 96;
+    if (hdc) {
+        dpi = (UINT)GetDeviceCaps(hdc, LOGPIXELSX);
+        ReleaseDC(hWnd, hdc);
+    }
+    return dpi ? dpi : 96;
+}
+
+static void ScaleChildrenForDpi(HWND hDlg, UINT oldDpi, UINT newDpi)
+{
+    if (oldDpi == 0 || newDpi == 0 || oldDpi == newDpi) return;
+
+    HWND hChild = GetTopWindow(hDlg);
+    while (hChild)
+    {
+        RECT rcChild; GetWindowRect(hChild, &rcChild);
+        MapWindowPoints(nullptr, hDlg, (LPPOINT)&rcChild, 2);
+
+        const int left   = MulDiv(rcChild.left,   (int)newDpi, (int)oldDpi);
+        const int top    = MulDiv(rcChild.top,    (int)newDpi, (int)oldDpi);
+        const int width  = MulDiv(rcChild.right - rcChild.left, (int)newDpi, (int)oldDpi);
+        const int height = MulDiv(rcChild.bottom - rcChild.top, (int)newDpi, (int)oldDpi);
+
+        SetWindowPos(hChild, nullptr, left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+
+        // Scale font; store created font to child prop for later cleanup/update
+        HFONT hFont = (HFONT)SendMessage(hChild, WM_GETFONT, 0, 0);
+        if (hFont)
+        {
+            LOGFONT lf{};
+            if (GetObject(hFont, sizeof(LOGFONT), &lf) == sizeof(LOGFONT))
+            {
+                lf.lfHeight = MulDiv(lf.lfHeight, (int)newDpi, (int)oldDpi);
+                HFONT hNew = CreateFontIndirect(&lf);
+                if (hNew)
+                {
+                    // delete previous created font if any
+                    HANDLE hPrev = GetProp(hChild, L"SFT_FONT");
+                    if (hPrev) { DeleteObject((HFONT)hPrev); RemoveProp(hChild, L"SFT_FONT"); }
+                    SetProp(hChild, L"SFT_FONT", (HANDLE)hNew);
+                    SendMessage(hChild, WM_SETFONT, (WPARAM)hNew, TRUE);
+                }
+            }
+        }
+
+        hChild = GetNextWindow(hChild, GW_HWNDNEXT);
+    }
+}
+
+static void CleanupScaledFonts(HWND hDlg)
+{
+    HWND hChild = GetTopWindow(hDlg);
+    while (hChild)
+    {
+        HANDLE hPrev = GetProp(hChild, L"SFT_FONT");
+        if (hPrev) { DeleteObject((HFONT)hPrev); RemoveProp(hChild, L"SFT_FONT"); }
+        hChild = GetNextWindow(hChild, GW_HWNDNEXT);
+    }
+}
+
+
 static void UpdatePortControl(HWND hDlg)
 {
     auto allPorts = GetAllPorts();
@@ -87,58 +228,6 @@ static void CenterParentWindow(HWND hWnd)
         SWP_NOZORDER | SWP_NOSIZE);
 }
 
-// 获取窗口的 DPI 比例
-static float GetDpiScale(HWND hWnd)
-{
-    UINT dpi = 96; // 默认 DPI
-    if (GetDpiForWindow)
-    {
-        dpi = GetDpiForWindow(hWnd);
-    }
-    return static_cast<float>(dpi) / 96.0f;
-}
-
-// 缩放对话框中的所有子控件，以保持布局一致性
-static void ScaleDialogControls(HWND hDlg)
-{
-    float dpiScale = GetDpiScale(hDlg);
-    if (dpiScale <= 1.0f) {
-        return; // 如果 DPI 比例小于等于 1.0，则无需缩放
-    }
-
-    // 遍历并缩放所有子控件
-    HWND hChild = GetTopWindow(hDlg);
-    while (hChild)
-    {
-        RECT rcChild;
-        // 获取控件在父窗口中的坐标
-        GetWindowRect(hChild, &rcChild);
-        MapWindowPoints(nullptr, hDlg, (LPPOINT)&rcChild, 2);
-
-        int newLeft = static_cast<int>(rcChild.left * dpiScale);
-        int newTop = static_cast<int>(rcChild.top * dpiScale);
-        int newChildWidth = static_cast<int>((rcChild.right - rcChild.left) * dpiScale);
-        int newChildHeight = static_cast<int>((rcChild.bottom - rcChild.top) * dpiScale);
-
-        SetWindowPos(hChild, nullptr, newLeft, newTop, newChildWidth, newChildHeight, SWP_NOZORDER);
-
-        // 缩放字体
-        HFONT hFont = (HFONT)SendMessage(hChild, WM_GETFONT, 0, 0);
-        if (hFont)
-        {
-            LOGFONT lf;
-            GetObject(hFont, sizeof(LOGFONT), &lf);
-            // 调整字体高度以匹配新的 DPI
-            lf.lfHeight = MulDiv(lf.lfHeight, GetDpiForWindow(hDlg), 96);
-            HFONT hNewFont = CreateFontIndirect(&lf);
-            SendMessage(hChild, WM_SETFONT, (WPARAM)hNewFont, TRUE);
-            DeleteObject(hFont); // 释放旧字体，避免内存泄漏
-        }
-
-        hChild = GetNextWindow(hChild, GW_HWNDNEXT);
-    }
-}
-
 typedef struct
 {
     DWORD Serial;
@@ -149,29 +238,6 @@ typedef struct
     DWORD FlowControl;
     DWORD Encoding;
 }SERIAL_CONFIG;
-
-static std::string ConvertEncoding(const std::string& text, DWORD from, DWORD to)
-{
-    if (text.empty() || from == to)
-        return text;
-
-    std::wstring wstr;
-    int wlen = MultiByteToWideChar(from, 0, text.c_str(), (int)text.size(), NULL, 0);
-    if (wlen > 0)
-    {
-        wstr.resize(wlen);
-        MultiByteToWideChar(from, 0, text.c_str(), (int)text.size(), &wstr[0], wlen);
-    }
-
-    std::string result;
-    int mblen = WideCharToMultiByte(to, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
-    if (mblen > 0)
-    {
-        result.resize(mblen);
-        WideCharToMultiByte(to, 0, wstr.c_str(), (int)wstr.size(), &result[0], mblen, NULL, NULL);
-    }
-    return result;
-}
 
 static SERIAL_CONFIG ReadSerialConfig()
 {
@@ -195,7 +261,7 @@ static SERIAL_CONFIG ReadSerialConfig()
         ::RegQueryValueEx(hKey, L"StopBit", 0, &dwType, (LPBYTE)&cfg.StopBit, &dwSize);
         ::RegQueryValueEx(hKey, L"Parity", 0, &dwType, (LPBYTE)&cfg.Parity, &dwSize);
         ::RegQueryValueEx(hKey, L"FlowControl", 0, &dwType, (LPBYTE)&cfg.FlowControl, &dwSize);
-        ::RegQueryValueExW(hKey, L"Encoding", 0, &dwType, (LPBYTE)&cfg.Encoding, &dwSize);
+        ::RegQueryValueEx(hKey, L"Encoding", 0, &dwType, (LPBYTE)&cfg.Encoding, &dwSize);
         ::RegCloseKey(hKey);
     }
     return cfg;
@@ -220,7 +286,7 @@ static void WriteSerialConfig(const SERIAL_CONFIG& cfg)
     }
 }
 
-static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& serialPort, const SERIAL_CONFIG& cfg, boost::system::error_code& ec)
+static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& serialPort,const SERIAL_CONFIG& cfg, boost::system::error_code& ec)
 {
     serialPort.set_option(boost::asio::serial_port::baud_rate(cfg.BaudRate), ec);
     if (ec)
@@ -279,7 +345,7 @@ static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& 
         serialPort.set_option(boost::asio::serial_port::flow_control(boost::asio::serial_port::flow_control::none), ec);
         break;
     }
-
+    
     return ec;
 }
 
@@ -322,62 +388,6 @@ static boost::system::error_code DoWork(boost::asio::io_context& ioctx, boost::a
     boost::asio::windows::stream_handle stdinput(ioctx);
     boost::asio::windows::stream_handle stdoutput(ioctx);
     const auto kBufferSize = 1024;
-
-    // 读取配置（包含编码设置）
-    auto cfg = ReadSerialConfig();
-
-    // 获取控制台当前输入和输出编码
-    UINT consoleInputCP = GetConsoleCP();
-    UINT consoleOutputCP = GetConsoleOutputCP();
-    const DWORD targetEncoding = cfg.Encoding;
-
-    // 编码转换函数
-    auto convertEncoding = [](const std::vector<uint8_t>& input, DWORD from, DWORD to) -> std::vector<uint8_t> {
-        if (input.empty() || from == to) {
-            return input;
-        }
-
-        // 将输入数据转换为宽字符
-        std::wstring wstr;
-        int wlen = MultiByteToWideChar(from, 0,
-            reinterpret_cast<const char*>(input.data()),
-            static_cast<int>(input.size()),
-            NULL, 0);
-        if (wlen <= 0) return input;
-
-        wstr.resize(wlen);
-        if (MultiByteToWideChar(from, 0,
-            reinterpret_cast<const char*>(input.data()),
-            static_cast<int>(input.size()),
-            &wstr[0], wlen) == 0) {
-            return input;
-        }
-
-        // 将宽字符转换为目标编码
-        std::vector<uint8_t> result;
-        int mblen = WideCharToMultiByte(to, 0, wstr.data(), static_cast<int>(wstr.size()),
-            NULL, 0, NULL, NULL);
-        if (mblen <= 0) return input;
-
-        result.resize(mblen);
-        if (WideCharToMultiByte(to, 0, wstr.data(), static_cast<int>(wstr.size()),
-            reinterpret_cast<char*>(result.data()), mblen, NULL, NULL) == 0) {
-            return input;
-        }
-        return result;
-        };
-
-    // 发送转换: 控制台输入编码 -> 目标编码
-    auto convertForSend = [&](const std::vector<uint8_t>& input) {
-        return convertEncoding(input, consoleInputCP, targetEncoding);
-        };
-
-    // 接收转换: 目标编码 -> 控制台输出编码
-    auto convertForRecv = [&](const std::vector<uint8_t>& input) {
-        return convertEncoding(input, targetEncoding, consoleOutputCP);
-        };
-
-    // 缓冲区
     std::vector<uint8_t> serialPortRecvBuffer;
     std::vector<uint8_t> serialPortSendBuffer;
     serialPortRecvBuffer.resize(kBufferSize);
@@ -392,105 +402,94 @@ static boost::system::error_code DoWork(boost::asio::io_context& ioctx, boost::a
     if (stdoutput.assign(conout, ec))
         return ec;
 
-    // 使用 std::function 定义处理器类型
-    using StreamHandler = std::function<void()>;
+    // Use console code pages and selected device encoding
+    UINT consoleInputCP = GetConsoleCP();
+    UINT consoleOutputCP = GetConsoleOutputCP();
+    DWORD deviceEncoding = ReadSerialConfig().Encoding;
 
-    // 创建处理器对象
+    // Pending buffers for chunked conversion
+    std::vector<uint8_t> pendingRecv; // device -> console
+    std::vector<uint8_t> pendingSend; // console -> device
+
+    auto processRecvChunk = [&](const uint8_t* data, size_t len) -> std::vector<uint8_t>
+    {
+        if (len) pendingRecv.insert(pendingRecv.end(), data, data + len);
+        size_t valid = ValidPrefixLen(pendingRecv, deviceEncoding);
+        if (valid == 0) return {};
+        auto out = ConvertEncodingBytes(pendingRecv.data(), valid, deviceEncoding, consoleOutputCP);
+        pendingRecv.erase(pendingRecv.begin(), pendingRecv.begin() + valid);
+        return out;
+    };
+
+    auto processSendChunk = [&](const uint8_t* data, size_t len) -> std::vector<uint8_t>
+    {
+        if (len) pendingSend.insert(pendingSend.end(), data, data + len);
+        size_t valid = ValidPrefixLen(pendingSend, consoleInputCP);
+        if (valid == 0) return {};
+        auto out = ConvertEncodingBytes(pendingSend.data(), valid, consoleInputCP, deviceEncoding);
+        pendingSend.erase(pendingSend.begin(), pendingSend.begin() + valid);
+        return out;
+    };
+
+    using StreamHandler = std::function<void()>;
     StreamHandler recvHandler;
     StreamHandler sendHandler;
 
-    // 接收方向：串口 -> 控制台
     recvHandler = [&]() {
         serialPort.async_read_some(
             boost::asio::buffer(serialPortRecvBuffer),
-            [&](const boost::system::error_code& ec, size_t bytes_transferred) {
-                if (ec) {
-                    std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
-                    return;
-                }
-
-                // 复制接收到的数据
-                std::vector<uint8_t> received(
-                    serialPortRecvBuffer.begin(),
-                    serialPortRecvBuffer.begin() + bytes_transferred
-                );
-
-                // 应用编码转换
-                auto converted = convertForRecv(received);
-
-                // 写入转换后的数据
+            [&](const boost::system::error_code& e, size_t bytes) {
+                if (e) { std::cerr << "\033[31merror: " << e.message() << "\033[0m\n"; return; }
+                std::vector<uint8_t> chunk(serialPortRecvBuffer.begin(), serialPortRecvBuffer.begin() + bytes);
+                auto converted = processRecvChunk(chunk.data(), chunk.size());
+                if (converted.empty()) { recvHandler(); return; }
+                auto outBuf = std::make_shared<std::vector<uint8_t>>(std::move(converted));
                 boost::asio::async_write(
                     stdoutput,
-                    boost::asio::buffer(converted),
-                    [&](const boost::system::error_code& ec, size_t) {
-                        if (ec) {
-                            std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
-                            return;
-                        }
-
-                        // 继续处理下一批数据
+                    boost::asio::buffer(*outBuf),
+                    [outBuf, &recvHandler](const boost::system::error_code& we, size_t) {
+                        if (we) { std::cerr << "\033[31merror: " << we.message() << "\033[0m\n"; return; }
                         recvHandler();
                     }
                 );
             }
         );
-        };
+    };
 
-    // 发送方向：控制台 -> 串口
     sendHandler = [&]() {
         stdinput.async_read_some(
             boost::asio::buffer(serialPortSendBuffer),
-            [&](const boost::system::error_code& ec, size_t bytes_transferred) {
-                if (ec) {
-                    std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
-                    return;
-                }
-
-                // 复制接收到的数据
-                std::vector<uint8_t> received(
-                    serialPortSendBuffer.begin(),
-                    serialPortSendBuffer.begin() + bytes_transferred
-                );
-
-                // 应用编码转换
-                auto converted = convertForSend(received);
-
-                // 写入转换后的数据
+            [&](const boost::system::error_code& e, size_t bytes) {
+                if (e) { std::cerr << "\033[31merror: " << e.message() << "\033[0m\n"; return; }
+                std::vector<uint8_t> chunk(serialPortSendBuffer.begin(), serialPortSendBuffer.begin() + bytes);
+                auto converted = processSendChunk(chunk.data(), chunk.size());
+                if (converted.empty()) { sendHandler(); return; }
+                auto outBuf = std::make_shared<std::vector<uint8_t>>(std::move(converted));
                 boost::asio::async_write(
                     serialPort,
-                    boost::asio::buffer(converted),
-                    [&](const boost::system::error_code& ec, size_t) {
-                        if (ec) {
-                            std::cerr << "\033[31merror: " << ec.message() << "\033[0m\n";
-                            return;
-                        }
-
-                        // 继续处理下一批数据
+                    boost::asio::buffer(*outBuf),
+                    [outBuf, &sendHandler](const boost::system::error_code& we, size_t) {
+                        if (we) { std::cerr << "\033[31merror: " << we.message() << "\033[0m\n"; return; }
                         sendHandler();
                     }
                 );
             }
         );
-        };
+    };
 
-    // 启动两个方向的处理器
     recvHandler();
     sendHandler();
 
-    // 运行IO上下文
     ioctx.run();
     return ec;
 }
 
 int wmain(int argc, const WCHAR* args[])
 {
-    // 设置进程为 Per-Monitor V2 DPI 感知，
-    if (S_OK != SetProcessDpiAwarenessContext(static_cast<DPI_AWARENESS_CONTEXT>(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))) 
-    {
-        // 如果失败，可以回退到旧的 API
+    // Enable Per-Monitor V2 DPI awareness (fallback to legacy if unavailable)
+    if (!SetProcessDpiAwarenessContext((DPI_AWARENESS_CONTEXT)DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
         SetProcessDPIAware();
     }
-
     boost::system::error_code ec;
     boost::asio::io_context ioctx;
     boost::asio::serial_port serialPort(ioctx);
@@ -523,7 +522,7 @@ int wmain(int argc, const WCHAR* args[])
             auto portName = std::string("COM") + std::to_string(cfg.Serial);
             if (serialPort.open(portName, ec))
             {
-                std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" << std::endl;
+                std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" <<std::endl;
                 std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
                 continue;
             }
@@ -556,30 +555,39 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
     switch (message)
     {
     case WM_INITDIALOG:
-        // 让 Windows 根据 DPI 自动初始化对话框大小
         CenterParentWindow(hDlg);
+    SetProp(hDlg, L"SFT_LastDPI", (HANDLE)(UINT_PTR)GetWindowDpi(hDlg));
         return (INT_PTR)TRUE;
     case WM_DPICHANGED:
     {
-        // 当 DPI 改变时，重新调整窗口大小并缩放内容
-        RECT* prcNewDialog = (RECT*)lParam;
+        // Adjust window size/position to the suggested rectangle
+        RECT* prcNewWindow = (RECT*)lParam;
         SetWindowPos(hDlg,
             NULL,
-            prcNewDialog->left,
-            prcNewDialog->top,
-            prcNewDialog->right - prcNewDialog->left,
-            prcNewDialog->bottom - prcNewDialog->top,
+            prcNewWindow->left,
+            prcNewWindow->top,
+            prcNewWindow->right - prcNewWindow->left,
+            prcNewWindow->bottom - prcNewWindow->top,
             SWP_NOZORDER | SWP_NOACTIVATE);
-        // 缩放子控件
-        ScaleDialogControls(hDlg);
+        {
+            UINT oldDpi = (UINT)(UINT_PTR)GetProp(hDlg, L"SFT_LastDPI");
+            UINT newDpi = HIWORD(wParam) ? HIWORD(wParam) : GetWindowDpi(hDlg);
+            ScaleChildrenForDpi(hDlg, oldDpi, newDpi);
+            SetProp(hDlg, L"SFT_LastDPI", (HANDLE)(UINT_PTR)newDpi);
+        }
         return (INT_PTR)TRUE;
     }
+
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             EndDialog(hDlg, LOWORD(wParam));
             return (INT_PTR)TRUE;
         }
+        break;
+    case WM_DESTROY:
+        CleanupScaledFonts(hDlg);
+        RemoveProp(hDlg, L"SFT_LastDPI");
         break;
     }
     return (INT_PTR)FALSE;
@@ -592,9 +600,8 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
     {
     case WM_INITDIALOG:
     {
-        //让 Windows 根据 DPI 自动初始化对话框大小
         CenterParentWindow(hDlg);
-
+        SetProp(hDlg, L"SFT_LastDPI", (HANDLE)(UINT_PTR)GetWindowDpi(hDlg));
         auto cfg = ReadSerialConfig();
         auto hWndPort = GetDlgItem(hDlg, IDC_COMBO_PORT);
         UpdatePortControl(hDlg);
@@ -617,7 +624,7 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
         }
 
         auto hWndBaudRate = GetDlgItem(hDlg, IDC_COMBO_SPEED);
-        ComboBox_AddString(hWndBaudRate, L"50");
+        ComboBox_AddString(hWndBaudRate, L"50"); 
         ComboBox_AddString(hWndBaudRate, L"75");
         ComboBox_AddString(hWndBaudRate, L"100");
         ComboBox_AddString(hWndBaudRate, L"105");
@@ -663,55 +670,64 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
         ComboBox_AddString(hWndFlowControl, L"硬件");
         ComboBox_SetCurSel(hWndFlowControl, (int)(cfg.FlowControl));
 
-        auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING);
-        ComboBox_AddString(hWndEncoding, L"UTF-8 (65001)");
-        ComboBox_AddString(hWndEncoding, L"GBK (936)");
-        ComboBox_AddString(hWndEncoding, L"BIG5 (950)");
-        ComboBox_AddString(hWndEncoding, L"Shift-JIS (932)");
-
-        int encodingIndex = 0;
-        switch (cfg.Encoding) {
-        case 936: encodingIndex = 1; break;
-        case 950: encodingIndex = 2; break;
-        case 932: encodingIndex = 3; break;
-        default: encodingIndex = 0; break;
+        // 编码下拉框
+        HWND hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING);
+        if (hWndEncoding)
+        {
+            ComboBox_AddString(hWndEncoding, L"UTF-8 (65001)");
+            ComboBox_AddString(hWndEncoding, L"GBK (936)");
+            ComboBox_AddString(hWndEncoding, L"BIG5 (950)");
+            ComboBox_AddString(hWndEncoding, L"Shift-JIS (932)");
+            int idx = 0;
+            switch (cfg.Encoding)
+            {
+            case 936: idx = 1; break;
+            case 950: idx = 2; break;
+            case 932: idx = 3; break;
+            default: idx = 0; break;
+            }
+            ComboBox_SetCurSel(hWndEncoding, idx);
         }
-        ComboBox_SetCurSel(hWndEncoding, encodingIndex);
 
+        return (INT_PTR)TRUE;
+    }
+    case WM_DPICHANGED:
+    {
+        // Adjust window size/position to the suggested rectangle
+        RECT* prcNewWindow = (RECT*)lParam;
+        SetWindowPos(hDlg,
+            NULL,
+            prcNewWindow->left,
+            prcNewWindow->top,
+            prcNewWindow->right - prcNewWindow->left,
+            prcNewWindow->bottom - prcNewWindow->top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        {
+            UINT oldDpi = (UINT)(UINT_PTR)GetProp(hDlg, L"SFT_LastDPI");
+            UINT newDpi = HIWORD(wParam) ? HIWORD(wParam) : GetWindowDpi(hDlg);
+            ScaleChildrenForDpi(hDlg, oldDpi, newDpi);
+            SetProp(hDlg, L"SFT_LastDPI", (HANDLE)(UINT_PTR)newDpi);
+        }
         return (INT_PTR)TRUE;
     }
     case WM_DEVICECHANGE:
         UpdatePortControl(hDlg);
         return (INT_PTR)TRUE;
-    case WM_DPICHANGED:
-    {
-        // 当 DPI 改变时，重新调整窗口大小并缩放内容
-        RECT* prcNewDialog = (RECT*)lParam;
-        SetWindowPos(hDlg,
-            NULL,
-            prcNewDialog->left,
-            prcNewDialog->top,
-            prcNewDialog->right - prcNewDialog->left,
-            prcNewDialog->bottom - prcNewDialog->top,
-            SWP_NOZORDER | SWP_NOACTIVATE);
-        // 缩放子控件
-        ScaleDialogControls(hDlg);
-        return (INT_PTR)TRUE;
-    }
     case WM_COMMAND:
         if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL)
         {
             if (LOWORD(wParam) == IDOK)
             {
-                SERIAL_CONFIG cfg = { 0 };
+                SERIAL_CONFIG cfg = {0};
                 auto hWndPort = GetDlgItem(hDlg, IDC_COMBO_PORT);
                 auto hWndBaudRate = GetDlgItem(hDlg, IDC_COMBO_SPEED);
                 auto hWndWordLength = GetDlgItem(hDlg, IDC_COMBO_WORD);
                 auto hWndStopBit = GetDlgItem(hDlg, IDC_COMBO_STOP);
                 auto hWndParity = GetDlgItem(hDlg, IDC_COMBO_PARITY);
                 auto hWndFlowControl = GetDlgItem(hDlg, IDC_COMBO_FLOW_CONTROL);
+                auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING);
 
-                WCHAR txtBuffer[32] = { 0 };
+                WCHAR txtBuffer[32] = {0};
                 auto curSel = ComboBox_GetCurSel(hWndPort);
                 if (curSel >= 0)
                 {
@@ -728,17 +744,17 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
                 cfg.StopBit = ComboBox_GetCurSel(hWndStopBit);
                 cfg.Parity = ComboBox_GetCurSel(hWndParity);
                 cfg.FlowControl = ComboBox_GetCurSel(hWndFlowControl);
-
-                auto hWndEncoding = GetDlgItem(hDlg, IDC_COMBO_ENCODING);
-                int encodingIndex = ComboBox_GetCurSel(hWndEncoding);
-                switch (encodingIndex) {
-                case 0: cfg.Encoding = CP_UTF8; break;    // 65001
-                case 1: cfg.Encoding = 936; break;        // GB2312
-                case 2: cfg.Encoding = 950; break;        // BIG5
-                case 3: cfg.Encoding = 932; break;        // Shift-JIS
-                default: cfg.Encoding = CP_UTF8; break;
+                if (hWndEncoding)
+                {
+                    int encSel = ComboBox_GetCurSel(hWndEncoding);
+                    switch (encSel)
+                    {
+                    case 1: cfg.Encoding = 936; break; // GBK
+                    case 2: cfg.Encoding = 950; break; // BIG5
+                    case 3: cfg.Encoding = 932; break; // Shift-JIS
+                    default: cfg.Encoding = CP_UTF8; break; // UTF-8
+                    }
                 }
-
                 WriteSerialConfig(cfg);
             }
             EndDialog(hDlg, LOWORD(wParam));
