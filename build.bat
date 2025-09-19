@@ -1,56 +1,87 @@
-﻿@echo off
-REM 确保中文正常显示（UTF-8）
-chcp 65001>nul
-setlocal EnableDelayedExpansion
+@echo off
+@REM 确保中文正常显示（UTF-8）
+@chcp 65001 > nul
+@setlocal EnableDelayedExpansion
 
 REM 参数解析
 set "ARCH=all"
 set "CFG=all"
 set "SHOW_HELP=0"
+set "INVALID_PARAM=0"
 
 for %%A in (%*) do (
+    set "VALID_PARAM=0"
+    
     REM 帮助
-    if /I "%%A"=="-help" set "SHOW_HELP=1"
-    if /I "%%A"=="-h" set "SHOW_HELP=1"
-    if /I "%%A"=="/?" set "SHOW_HELP=1"
-
+    if /I "%%A"=="-help" (set "SHOW_HELP=1" & set "VALID_PARAM=1")
+    if /I "%%A"=="-h" (set "SHOW_HELP=1" & set "VALID_PARAM=1")
+    if /I "%%A"=="-?" (set "SHOW_HELP=1" & set "VALID_PARAM=1")
+    
     REM 架构
-    if /I "%%A"=="-x86" set "ARCH=x86"
-    if /I "%%A"=="-win32" set "ARCH=x86"
-    if /I "%%A"=="x86" set "ARCH=x86"
-    if /I "%%A"=="win32" set "ARCH=x86"
-    if /I "%%A"=="-x64" set "ARCH=x64"
-    if /I "%%A"=="x64" set "ARCH=x64"
+    if /I "%%A"=="-x86" (set "ARCH=x86" & set "VALID_PARAM=1")
+    if /I "%%A"=="-win32" (set "ARCH=x86" & set "VALID_PARAM=1")
+    if /I "%%A"=="x86" (set "ARCH=x86" & set "VALID_PARAM=1")
+    if /I "%%A"=="win32" (set "ARCH=x86" & set "VALID_PARAM=1")
+    if /I "%%A"=="-x64" (set "ARCH=x64" & set "VALID_PARAM=1")
+    if /I "%%A"=="x64" (set "ARCH=x64" & set "VALID_PARAM=1")
 
     REM 配置
-    if /I "%%A"=="-debug" set "CFG=debug"
-    if /I "%%A"=="-dbg" set "CFG=debug"
-    if /I "%%A"=="-d" set "CFG=debug"
-    if /I "%%A"=="debug" set "CFG=debug"
-    if /I "%%A"=="dbg" set "CFG=debug"
-    if /I "%%A"=="-release" set "CFG=release"
-    if /I "%%A"=="-rel" set "CFG=release"
-    if /I "%%A"=="-r" set "CFG=release"
-    if /I "%%A"=="release" set "CFG=release"
-    if /I "%%A"=="rel" set "CFG=release"
+    if /I "%%A"=="-debug" (set "CFG=debug" & set "VALID_PARAM=1")
+    if /I "%%A"=="-dbg" (set "CFG=debug" & set "VALID_PARAM=1")
+    if /I "%%A"=="-d" (set "CFG=debug" & set "VALID_PARAM=1")
+    if /I "%%A"=="debug" (set "CFG=debug" & set "VALID_PARAM=1")
+    if /I "%%A"=="dbg" (set "CFG=debug" & set "VALID_PARAM=1")
+    if /I "%%A"=="-release" (set "CFG=release" & set "VALID_PARAM=1")
+    if /I "%%A"=="-rel" (set "CFG=release" & set "VALID_PARAM=1")
+    if /I "%%A"=="-r" (set "CFG=release" & set "VALID_PARAM=1")
+    if /I "%%A"=="release" (set "CFG=release" & set "VALID_PARAM=1")
+    if /I "%%A"=="rel" (set "CFG=release" & set "VALID_PARAM=1")
 
     REM 全部
-    if /I "%%A"=="-all" (set "ARCH=all" & set "CFG=all")
-    if /I "%%A"=="all" (set "ARCH=all" & set "CFG=all")
-    if /I "%%A"=="-a" (set "ARCH=all" & set "CFG=all")
+    if /I "%%A"=="-all" (set "ARCH=all" & set "CFG=all" & set "VALID_PARAM=1")
+    if /I "%%A"=="all" (set "ARCH=all" & set "CFG=all" & set "VALID_PARAM=1")
+    if /I "%%A"=="-a" (set "ARCH=all" & set "CFG=all" & set "VALID_PARAM=1")
+    
+    REM 检查是否为无效参数
+    if !VALID_PARAM! EQU 0 (
+        echo 错误: 无效参数 "%%A"
+        set "INVALID_PARAM=1"
+    )
 )
 
-if %SHOW_HELP% EQU 1 (
+REM 如果有无效参数，显示帮助信息并退出
+if !INVALID_PARAM! EQU 1 (
     echo.
     echo 用法: build.bat [选项]
     echo.
     echo 选项:
-    echo   -help, -h, /?        显示本帮助信息
+    echo   -help, -h, -?        显示本帮助信息
+    @echo off
     echo   -x86, -win32         构建 x86 架构
     echo   -x64                 构建 x64 架构
     echo   -debug, -dbg, -d     构建 Debug 版本
     echo   -release, -rel, -r   构建 Release 版本
-    echo   -all, -a             构建全部（架构 ^+ 配置）
+    echo   -all, -a             构建全部（架构 + 配置）
+    @echo off
+    echo   默认: 构建全部
+    echo.
+    exit /b 1
+)
+
+REM 如果请求帮助，显示帮助信息并正常退出
+if !SHOW_HELP! EQU 1 (
+    echo.
+    echo 用法: build.bat [选项]
+    echo.
+    echo 选项:
+    echo   -help, -h, -?        显示本帮助信息
+    @echo off
+    echo   -x86, -win32         构建 x86 架构
+    echo   -x64                 构建 x64 架构
+    echo   -debug, -dbg, -d     构建 Debug 版本
+    echo   -release, -rel, -r   构建 Release 版本
+    echo   -all, -a             构建全部（架构 + 配置）
+    @echo off
     echo   默认: 构建全部
     echo.
     exit /b 0
@@ -108,24 +139,24 @@ if not exist "bin" mkdir bin
 REM 构建矩阵
 set "BUILD_OK=1"
 
-if "%ARCH%"=="all" (
+if "!ARCH!"=="all" (
     set "ARCHLIST=Win32 x64"
-) else if "%ARCH%"=="x86" (
+) else if "!ARCH!"=="x86" (
     set "ARCHLIST=Win32"
-) else if "%ARCH%"=="x64" (
+) else if "!ARCH!"=="x64" (
     set "ARCHLIST=x64"
 )
 
-if "%CFG%"=="all" (
+if "!CFG!"=="all" (
     set "CFGLIST=Debug Release"
-) else if "%CFG%"=="debug" (
+) else if "!CFG!"=="debug" (
     set "CFGLIST=Debug"
-) else if "%CFG%"=="release" (
+) else if "!CFG!"=="release" (
     set "CFGLIST=Release"
 )
 
-for %%P in (%ARCHLIST%) do (
-    for %%C in (%CFGLIST%) do (
+for %%P in (!ARCHLIST!) do (
+    for %%C in (!CFGLIST!) do (
         echo 正在构建 %%P %%C...
         msbuild SerialForWindowsTerminal.vcxproj /p:Configuration=%%C /p:Platform=%%P /t:Rebuild
         if errorlevel 1 (
@@ -135,36 +166,37 @@ for %%P in (%ARCHLIST%) do (
     )
 )
 
-if "%BUILD_OK%"=="0" (
+if "!BUILD_OK!"=="0" (
     echo 部分目标构建失败
     exit /b 1
 )
 
 echo 所有指定目标构建成功
+@echo off
 echo 构建产物位于 Debug/Release 与 x64/Debug/Release 目录
 
 REM 复制产物到 bin 目录
-if "%ARCH%"=="all" (
+if "!ARCH!"=="all" (
     copy "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" >nul
     copy "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" >nul
     copy "x64\Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_debug.exe" >nul
     copy "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" >nul
-) else if "%ARCH%"=="x86" (
-    if "%CFG%"=="all" (
+) else if "!ARCH!"=="x86" (
+    if "!CFG!"=="all" (
         copy "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" >nul
         copy "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" >nul
-    ) else if "%CFG%"=="debug" (
+    ) else if "!CFG!"=="debug" (
         copy "Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_debug.exe" >nul
-    ) else if "%CFG%"=="release" (
+    ) else if "!CFG!"=="release" (
         copy "Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x86_release.exe" >nul
     )
-) else if "%ARCH%"=="x64" (
-    if "%CFG%"=="all" (
+) else if "!ARCH!"=="x64" (
+    if "!CFG!"=="all" (
         copy "x64\Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_debug.exe" >nul
         copy "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" >nul
-    ) else if "%CFG%"=="debug" (
+    ) else if "!CFG!"=="debug" (
         copy "x64\Debug\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_debug.exe" >nul
-    ) else if "%CFG%"=="release" (
+    ) else if "!CFG!"=="release" (
         copy "x64\Release\SerialForWindowsTerminal.exe" "bin\SerialForWindowsTerminal_x64_release.exe" >nul
     )
 )

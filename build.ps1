@@ -21,18 +21,43 @@ $OutputEncoding = $utf8           # 外部进程与管道编码
 
 # Normalize unmatched args to support forms like: x64 debug all
 $normalized = @()
+$invalidArgs = @()
 foreach ($arg in $args) {
     if ($null -ne $arg) { $normalized += ($arg.ToString()).ToLowerInvariant() }
 }
+
 foreach ($a in $normalized) {
+    $validArg = $false
     switch -regex ($a) {
-        '^(?:-)?(?:help|h|\?)$'     { $help = $true }
-        '^(?:-)?(?:all|a)$'          { $all = $true }
-        '^(?:-)?(?:x64)$'            { $x64 = $true }
-        '^(?:-)?(?:x86|win32)$'      { $x86 = $true }
-        '^(?:-)?(?:debug|dbg|d)$'    { $dbg = $true }
-        '^(?:-)?(?:release|rel|r)$'  { $rel = $true }
+        '^(?:-)?(?:help|h|\?)$'     { $help = $true; $validArg = $true }
+        '^(?:-)?(?:all|a)$'          { $all = $true; $validArg = $true }
+        '^(?:-)?(?:x64)$'            { $x64 = $true; $validArg = $true }
+        '^(?:-)?(?:x86|win32)$'      { $x86 = $true; $validArg = $true }
+        '^(?:-)?(?:debug|dbg|d)$'    { $dbg = $true; $validArg = $true }
+        '^(?:-)?(?:release|rel|r)$'  { $rel = $true; $validArg = $true }
     }
+    if (-not $validArg) {
+        $invalidArgs += $a
+    }
+}
+
+# 如果有无效参数，显示错误和帮助信息
+if ($invalidArgs.Count -gt 0) {
+    foreach ($invalidArg in $invalidArgs) {
+        Write-Host "错误: 无效参数 '$invalidArg'" -ForegroundColor Red
+    }
+    Write-Host ""
+    Write-Host "用法: build.ps1 [选项]"
+    Write-Host ""
+    Write-Host "选项:"
+    Write-Host "  -help, -h, -?        显示本帮助信息"
+    Write-Host "  -x86, -win32         构建 x86 架构"
+    Write-Host "  -x64                 构建 x64 架构"
+    Write-Host "  -debug, -dbg, -d     构建 Debug 版本"
+    Write-Host "  -release, -rel, -r   构建 Release 版本"
+    Write-Host "  -all, -a             构建全部（架构 + 配置）"
+    Write-Host "  默认: 构建全部"
+    exit 1
 }
 
 # Defaults

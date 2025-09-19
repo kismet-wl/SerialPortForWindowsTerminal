@@ -735,8 +735,8 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
                 }
                 else
                 {
-                    ComboBox_GetText(hWndPort, txtBuffer, 32);
-                    cfg.Serial = std::wcstoul(txtBuffer + 3, nullptr, 10);
+                    // 如果没有选择任何串口，使用默认值
+                    cfg.Serial = 0;
                 }
                 ComboBox_GetText(hWndBaudRate, txtBuffer, 32);
                 cfg.BaudRate = std::wcstoul(txtBuffer, nullptr, 10);
