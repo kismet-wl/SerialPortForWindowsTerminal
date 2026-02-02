@@ -6,10 +6,10 @@ Serial port for windows terminal, 让Windows Terminal支持串口的插件
 
 ## 使用说明
 
-![截图](https://github.com/Zhou-zhi-peng/SerialPortForWindowsTerminal/blob/main/images/001.bmp?raw=true)
-![截图](https://github.com/Zhou-zhi-peng/SerialPortForWindowsTerminal/blob/main/images/002.bmp?raw=true)
-![截图](https://github.com/Zhou-zhi-peng/SerialPortForWindowsTerminal/blob/main/images/003.bmp?raw=true)
+![截图](images/001.bmp)
+![截图](images/002.bmp)
+![截图](images/003.bmp)
 
 
 ## 配置说明：
-![使用说明](https://github.com/Zhou-zhi-peng/SerialPortForWindowsTerminal/blob/main/images/000.gif?raw=true)
+![使用说明](images/000.gif)
